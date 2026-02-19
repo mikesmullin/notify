@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser, ValueEnum};
 use futures_util::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use zbus::Proxy;
 use zvariant::{OwnedValue, Str};
@@ -125,6 +125,62 @@ struct YamlPayload {
     print_id: Option<bool>,
     #[serde(rename = "await")]
     await_result: Option<bool>,
+    card: Option<YamlCard>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+enum YamlCard {
+    MultipleChoice {
+        question: String,
+        choices: Vec<YamlCardChoice>,
+        #[serde(default)]
+        allow_other: bool,
+    },
+    Permission {
+        question: String,
+        allow_label: Option<String>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum YamlCardChoice {
+    Label(String),
+    Object { id: String, label: String },
+}
+
+#[derive(Debug, Serialize)]
+struct CardChoice {
+    id: String,
+    label: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+enum CardPayload {
+    MultipleChoice {
+        question: String,
+        choices: Vec<CardChoice>,
+        allow_other: bool,
+    },
+    Permission {
+        question: String,
+        allow_label: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct CardEnvelope {
+    xnotid_card: String,
+    #[serde(flatten)]
+    payload: CardPayload,
+}
+
+struct CardRender {
+    body_json: String,
+    actions: Vec<(String, String)>,
+    default_summary: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -305,8 +361,8 @@ fn merge_request(cli: Cli, payload: Option<YamlPayload>, stdin_body: Option<Stri
         Some(cli.body.join(" "))
     };
 
-    let summary = sanitize_text(cli.summary.or(payload.summary).unwrap_or_default());
-    let body = sanitize_text(
+    let mut summary = sanitize_text(cli.summary.or(payload.summary).unwrap_or_default());
+    let mut body = sanitize_text(
         stdin_body
             .or(body_from_cli)
             .or(payload.body)
@@ -346,6 +402,28 @@ fn merge_request(cli: Cli, payload: Option<YamlPayload>, stdin_body: Option<Stri
         hints.insert(key, value);
     }
 
+    if let Some(card) = payload.card {
+        if !body.is_empty() {
+            bail!("cannot combine 'card' with explicit body input; use one or the other");
+        }
+
+        let card_render = render_card(card)?;
+        body = sanitize_text(card_render.body_json);
+        if summary.is_empty() {
+            summary = card_render.default_summary;
+        }
+
+        if actions.is_empty() {
+            for (id, label) in card_render.actions {
+                actions.push(sanitize_text(id));
+                actions.push(sanitize_text(label));
+            }
+        }
+
+        hints.insert("x-card".to_string(), OwnedValue::from(true));
+        hints.insert("x-card-version".to_string(), OwnedValue::from(Str::from("v1")));
+    }
+
     let replaces_id = cli
         .replace_id
         .or(payload.replace)
@@ -377,6 +455,103 @@ fn merge_request(cli: Cli, payload: Option<YamlPayload>, stdin_body: Option<Stri
         await_result,
         await_timeout_ms,
     })
+}
+
+fn render_card(card: YamlCard) -> Result<CardRender> {
+    match card {
+        YamlCard::MultipleChoice {
+            question,
+            choices,
+            allow_other,
+        } => {
+            if choices.is_empty() {
+                bail!("multiple-choice card requires at least one choice");
+            }
+
+            let mut normalized_choices = Vec::with_capacity(choices.len());
+            let mut actions = Vec::with_capacity(choices.len());
+
+            for (index, choice) in choices.into_iter().enumerate() {
+                let (id, label) = match choice {
+                    YamlCardChoice::Label(label) => {
+                        let id = normalize_choice_id(&label, index + 1);
+                        (id, label)
+                    }
+                    YamlCardChoice::Object { id, label } => (id, label),
+                };
+
+                let id = sanitize_text(id.trim().to_string());
+                let label = sanitize_text(label.trim().to_string());
+                if id.is_empty() || label.is_empty() {
+                    bail!("card choices must have non-empty id and label");
+                }
+
+                normalized_choices.push(CardChoice {
+                    id: id.clone(),
+                    label: label.clone(),
+                });
+                actions.push((id, label));
+            }
+
+            let envelope = CardEnvelope {
+                xnotid_card: "v1".to_string(),
+                payload: CardPayload::MultipleChoice {
+                    question: sanitize_text(question),
+                    choices: normalized_choices,
+                    allow_other,
+                },
+            };
+            let body_json = serde_json::to_string(&envelope)
+                .context("failed to serialize multiple-choice card body")?;
+
+            Ok(CardRender {
+                body_json,
+                actions,
+                default_summary: "Question".to_string(),
+            })
+        }
+        YamlCard::Permission {
+            question,
+            allow_label,
+        } => {
+            let allow_label = sanitize_text(allow_label.unwrap_or_else(|| "Allow".to_string()));
+            let envelope = CardEnvelope {
+                xnotid_card: "v1".to_string(),
+                payload: CardPayload::Permission {
+                    question: sanitize_text(question),
+                    allow_label: allow_label.clone(),
+                },
+            };
+            let body_json = serde_json::to_string(&envelope)
+                .context("failed to serialize permission card body")?;
+
+            Ok(CardRender {
+                body_json,
+                actions: vec![("allow".to_string(), allow_label)],
+                default_summary: "Permission".to_string(),
+            })
+        }
+    }
+}
+
+fn normalize_choice_id(label: &str, fallback_index: usize) -> String {
+    let mut normalized = String::with_capacity(label.len());
+    for character in label.chars() {
+        if character.is_ascii_alphanumeric() {
+            normalized.push(character.to_ascii_lowercase());
+        } else if (character.is_ascii_whitespace() || character == '-' || character == '_')
+            && !normalized.ends_with('_')
+        {
+            normalized.push('_');
+        }
+    }
+
+    let normalized = normalized.trim_matches('_').to_string();
+    if normalized.is_empty() {
+        format!("choice_{fallback_index}")
+    } else {
+        normalized
+    }
 }
 
 fn parse_yaml_action(action: YamlAction) -> Result<(String, String)> {
@@ -478,7 +653,14 @@ async fn await_notification_result(
                     let msg = maybe_msg.context("action signal stream ended")?;
                     let (signal_id, action_key): (u32, String) = msg.body().deserialize().context("failed to decode ActionInvoked")?;
                     if signal_id == id {
-                        let output = if print_id {
+                        let parsed_action = serde_json::from_str::<serde_json::Value>(&action_key).ok();
+                        let output = if let Some(action_data) = parsed_action {
+                            if print_id {
+                                json!({"event":"action","id": id, "action_data": action_data})
+                            } else {
+                                json!({"event":"action","action_data": action_data})
+                            }
+                        } else if print_id {
                             json!({"event":"action","id": id, "action": action_key})
                         } else {
                             json!({"event":"action","action": action_key})

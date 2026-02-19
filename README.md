@@ -52,6 +52,47 @@ print_id: true
 await: true
 ```
 
+### Card payloads (for xnotid)
+
+`notify` can generate structured card JSON in the notification body from YAML `card` definitions.
+
+Multiple-choice card:
+
+```yaml
+summary: Clarification needed
+timeout: 0
+await: true
+card:
+  type: multiple-choice
+  question: Which deployment environment should I use?
+  choices:
+    - id: dev
+      label: Dev
+    - id: staging
+      label: Staging
+    - id: prod
+      label: Production
+  allow_other: true
+```
+
+Permission card:
+
+```yaml
+summary: Permission request
+timeout: 0
+await: true
+card:
+  type: permission
+  question: Allow me to run the database migration now?
+  allow_label: Allow
+```
+
+Notes:
+
+- If `card` is provided, `body` must not also be provided.
+- If no explicit `actions` are passed, `notify` auto-populates fallback actions from the card.
+- For `multiple-choice` with `allow_other: true`, xnotid emits action keys like `other:...`.
+
 ## Examples
 
 Send from file:
@@ -83,6 +124,18 @@ Send interactive question and wait for user response:
 ```bash
 notify --file question.yaml --timeout=0 \
   --action=approve:Approve --action=deny:Deny --await
+```
+
+Send a multiple-choice card and await selection:
+
+```bash
+notify --file card.multiple-choice.yaml --await --print-id --timeout=0
+```
+
+Send a permission card and await selection:
+
+```bash
+notify --file card.permission.yaml --await --print-id --timeout=0
 ```
 
 Bound await time using `-t/--timeout`:
